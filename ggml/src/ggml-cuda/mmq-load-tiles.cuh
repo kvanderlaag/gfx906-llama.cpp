@@ -491,6 +491,40 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI8_0;
     const int kqsx = txi % QI8_0;
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    // gfx906: issue all global loads for a chunk of rows into registers before
+    // writing them to LDS. This exposes more memory-level parallelism than the
+    // interleaved load/store loop.
+    constexpr int loop_iters = I / (nrows*nwarps);
+    constexpr int cache_size = loop_iters > 16 ? 16 : loop_iters;
+    static_assert(loop_iters % cache_size == 0, "cache_size must divide loop_iters");
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps*cache_size) {
+        int qs0_cache[cache_size];
+        int qs1_cache[cache_size];
+        int i_slot_cache[cache_size];
+#pragma unroll
+        for (int iter = 0; iter < cache_size; ++iter) {
+            // Avoid LDS write conflicts in the fallback path: clamping i makes every
+            // out-of-bounds thread write to the same slot. Write to the original slot
+            // instead and zero the out-of-bounds entries.
+            const int i_slot = i0 + iter*nrows*nwarps + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+            const int i_read = fallback ? min(i_slot, i_max) : i_slot;
+            const bool oob   = fallback && (i_slot > i_max);
+
+            const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i_read*stride + kbx;
+
+            qs0_cache[iter] = oob ? 0 : get_int_b2(bxi[0].qs,                   kqsx);
+            qs1_cache[iter] = oob ? 0 : get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+            i_slot_cache[iter] = i_slot;
+        }
+#pragma unroll
+        for (int iter = 0; iter < cache_size; ++iter) {
+            x_qs[i_slot_cache[iter]*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = qs0_cache[iter];
+            x_qs[i_slot_cache[iter]*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = qs1_cache[iter];
+        }
+    }
+#else
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         // Avoid LDS write conflicts in the fallback path: clamping i makes every
@@ -510,6 +544,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_qs[i_slot*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = oob ? 0 : get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
+#endif // defined(GGML_USE_HIP) && defined(__gfx906__)
 
     constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
     constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
