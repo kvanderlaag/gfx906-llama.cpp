@@ -455,6 +455,77 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+// DPP-based float warp reductions for GCN. The fused add/max DPP ops combine the
+// shuffle and the combine step into one instruction, and LDS reads/writes are
+// avoided for the xor4/xor16 steps via v_mov/v_add with row/bank masks.
+#define GGML_CUDA_DPP_F32(name, barrier, dpp_ctrl, vop)                     \
+    static __device__ __forceinline__ float name(float x) {                 \
+        float result;                                                       \
+        asm volatile(                                                       \
+            barrier                                                         \
+            vop " %0, %1, %1 " dpp_ctrl " row_mask:0xf bank_mask:0xf"       \
+            : "=v"(result) : "v"(x) : "memory"                              \
+        );                                                                  \
+        return result;                                                      \
+    }
+
+GGML_CUDA_DPP_F32(ggml_cuda_dpp_add_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_add_f32_dpp")
+GGML_CUDA_DPP_F32(ggml_cuda_dpp_add_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_add_f32_dpp")
+GGML_CUDA_DPP_F32(ggml_cuda_dpp_add_xor8_f32, "s_nop 1\n", "row_ror:8",           "v_add_f32_dpp")
+GGML_CUDA_DPP_F32(ggml_cuda_dpp_max_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_max_f32_dpp")
+GGML_CUDA_DPP_F32(ggml_cuda_dpp_max_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_max_f32_dpp")
+GGML_CUDA_DPP_F32(ggml_cuda_dpp_max_xor8_f32, "s_nop 1\n", "row_ror:8",           "v_max_f32_dpp")
+
+#undef GGML_CUDA_DPP_F32
+
+static __device__ __forceinline__ float ggml_cuda_dpp_shfl_xor4_f32(float x) {
+    const int v_src = __float_as_int(x);
+    int v_dst;
+    asm volatile(
+        "v_mov_b32 %0, %1\n"
+        "s_nop 1\n"
+        "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
+        "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
+        : "=v"(v_dst) : "v"(v_src) : "memory"
+    );
+    return __int_as_float(v_dst);
+}
+
+static __device__ __forceinline__ float ggml_cuda_dpp_shfl_xor16_f32(float x) {
+    const int v_src = __float_as_int(x);
+    int v_dst;
+    asm volatile(
+        "ds_swizzle_b32 %0, %1 offset:swizzle(SWAP,16)\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        : "=v"(v_dst) : "v"(v_src) : "memory"
+    );
+    return __int_as_float(v_dst);
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ float ggml_cuda_dpp_reduce_sum_f32(float x) {
+    if (width >= 2)  x = ggml_cuda_dpp_add_xor1_f32(x);
+    if (width >= 4)  x = ggml_cuda_dpp_add_xor2_f32(x);
+    if (width >= 8)  x += ggml_cuda_dpp_shfl_xor4_f32(x);
+    if (width >= 16) x = ggml_cuda_dpp_add_xor8_f32(x);
+    if (width >= 32) x += ggml_cuda_dpp_shfl_xor16_f32(x);
+    if (width == 64) x += __shfl_xor_sync(0xffffffff, x, 32, 64);
+    return x;
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ float ggml_cuda_dpp_reduce_max_f32(float x) {
+    if (width >= 2)  x = ggml_cuda_dpp_max_xor1_f32(x);
+    if (width >= 4)  x = ggml_cuda_dpp_max_xor2_f32(x);
+    if (width >= 8)  x = fmaxf(x, ggml_cuda_dpp_shfl_xor4_f32(x));
+    if (width >= 16) x = ggml_cuda_dpp_max_xor8_f32(x);
+    if (width >= 32) x = fmaxf(x, ggml_cuda_dpp_shfl_xor16_f32(x));
+    if (width == 64) x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 32, 64));
+    return x;
+}
+#endif // defined(GGML_USE_HIP) && defined(__gfx906__)
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -470,11 +541,15 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    return ggml_cuda_dpp_reduce_sum_f32<width>(x);
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#endif // defined(GGML_USE_HIP) && defined(__gfx906__)
 }
 
 template<int width = WARP_SIZE>
@@ -530,11 +605,15 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    return ggml_cuda_dpp_reduce_max_f32<width>(x);
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+#endif // defined(GGML_USE_HIP) && defined(__gfx906__)
 }
 
 template<typename T, int width = WARP_SIZE>
