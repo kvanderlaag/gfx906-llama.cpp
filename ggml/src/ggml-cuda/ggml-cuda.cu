@@ -2580,6 +2580,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
+#ifdef GGML_USE_HIP
+        // SOLVE_TRI: batched TRSM crashes in rocBLAS on ROCm, so cannot use CUDA graphs
+        if (node->op == GGML_OP_SOLVE_TRI) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to SOLVE_TRI on ROCm\n", __func__);
+#endif
+        }
+#endif
+
         if (!use_cuda_graph) {
             break;
         }
@@ -5510,6 +5520,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+#ifdef GGML_USE_HIP
+            {
+                // SOLVE_TRI: rocBLAS batched TRSM crashes on AMD GCN, so only support small matrices
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                if (GGML_CUDA_CC_IS_GCN(cc)) {
+                    if (op->src[0] && op->src[1]) {
+                        return op->src[0]->ne[0] <= 64 && op->src[1]->ne[0] <= 32;
+                    }
+                    return false;
+                }
+            }
+#endif
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
