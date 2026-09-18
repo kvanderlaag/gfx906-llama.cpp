@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-gfx906.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1257,6 +1258,29 @@ static void mul_mat_vec_q_switch_type(
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+        // gfx906: the generic per-thread K loop underutilizes the memory system on small
+        // matrices, use the warp-cooperative kernels instead.
+        if (cc == GGML_CUDA_CC_VEGA20 && ncols_dst == 1 && !has_fusion && ncols_x <= 1024 &&
+                (type_x == GGML_TYPE_Q4_0 || type_x == GGML_TYPE_Q4_1 || type_x == GGML_TYPE_Q8_0)) {
+            const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+            const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+            const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst / nsamples_x);
+
+            gfx906_launch_mul_mat_vec_warp_coop(
+                type_x, vx, vy, ids, dst, ncols_x, nchannels_y_fd, stride_row_x,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                nrows_x, nchannels_dst, nsamples_dst, stream);
+            return;
+        }
+    }
+#endif
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
