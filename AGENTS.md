@@ -36,7 +36,11 @@ AI usage rules (violations can close the PR immediately):
 - Prefer reusing existing infrastructure over new subsystems.
 - Do NOT add new files under `tests/*` without maintainers' approval, and do not add tests for trivial features. Reuse existing test infrastructure.
 
+Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
+
 Example of the commit style:
+
+Commit message:
 
 ```
 llama : fix KV being cleared during context shift
