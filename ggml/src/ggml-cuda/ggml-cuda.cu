@@ -1879,6 +1879,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // Must come before any cuBLAS call: rocBLAS cannot handle these shapes at all.
+    if (ggml_cuda_should_use_mmvf_small(src0->type, ggml_cuda_info().devices[ctx.device].cc, src0->ne, ne11)
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        ggml_cuda_mul_mat_vec_f_small(ctx, src0, src1, dst);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.

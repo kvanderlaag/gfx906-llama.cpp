@@ -2,8 +2,14 @@
 
 #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
 
+#define MMVF_SMALL_MAX_K 8 // Max. ne00 for mul_mat_vec_f_small, which works around a rocBLAS crash.
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+
+void ggml_cuda_mul_mat_vec_f_small(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+bool ggml_cuda_should_use_mmvf_small(enum ggml_type type, int cc, const int64_t * src0_ne, int64_t ne11);
 
 void ggml_cuda_op_mul_mat_vec_f(
     ggml_backend_cuda_context & ctx,

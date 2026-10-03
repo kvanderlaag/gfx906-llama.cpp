@@ -789,6 +789,83 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// rocBLAS crashes in rocblas_gemvt_kernel for an F32 GEMM with a single column and ne00 <= 8,
+// reproduced on gfx906 with ROCm 7.1.1 / rocBLAS 5.1.1 through both hipblasGemmStridedBatchedEx and
+// hipblasGemmEx. Real models do hit these shapes (minimax-01 segfaults without this), so compute them
+// here. ne00 is tiny, hence one thread per row of src0 and no cross-thread reduction.
+static __global__ void mul_mat_vec_f_small(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ne00, const int ne01, const int r2, const int r3,
+        const int s01, const int s02, const int s03,
+        const int s12, const int s13,
+        const int s1, const int s2, const int s3) {
+
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= ne01) {
+        return;
+    }
+
+    // src0 is broadcast over the batch and sample dimensions by repeating whole batches, dst is not
+    const int i2 = blockIdx.y / r2;
+    const int i3 = blockIdx.z / r3;
+
+    // nb00 and nb10 are asserted to be the type size, so elements within a row/column are contiguous
+    const float * x_row = x + i3*s03 + i2*s02 + row*s01;
+    const float * y_col = y + blockIdx.z*s13 + blockIdx.y*s12;
+
+    float sumf = 0.0f;
+    for (int k = 0; k < ne00; ++k) {
+        sumf += x_row[k]*y_col[k];
+    }
+
+    dst[blockIdx.z*s3 + blockIdx.y*s2 + row*s1] = sumf;
+}
+
+void ggml_cuda_mul_mat_vec_f_small(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    GGML_ASSERT(dst->ne[0] == ne01);
+    GGML_ASSERT(dst->ne[1] == 1);
+    GGML_ASSERT(dst->ne[2] == ne12);
+    GGML_ASSERT(dst->ne[3] == ne13);
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+
+    const int r2 = ne12/ne02;
+    const int r3 = ne13/ne03;
+
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    const dim3 block_nums((ne01 + warp_size - 1)/warp_size, ne12, ne13);
+    const dim3 block_dims(warp_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, ctx.stream()};
+
+    ggml_cuda_kernel_launch(mul_mat_vec_f_small, launch_params,
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data, ne00, ne01, r2, r3,
+        nb01/ggml_type_size(src0->type), nb02/ggml_type_size(src0->type), nb03/ggml_type_size(src0->type),
+        nb12/ggml_type_size(src1->type), nb13/ggml_type_size(src1->type),
+        nb0/ggml_type_size(dst->type),  nb2/ggml_type_size(dst->type),  nb3/ggml_type_size(dst->type));
+}
+
+bool ggml_cuda_should_use_mmvf_small(enum ggml_type type, int cc, const int64_t * src0_ne, int64_t ne11) {
+    // Restrict to gfx8/gfx9: the arch macros that would express this are only defined in the device
+    // pass, so match on the runtime cc instead. Wave32 parts have not been observed to hit this.
+    if (cc < GGML_CUDA_CC_OFFSET_AMD) {
+        return false;
+    }
+    const int gfx_cc = cc - GGML_CUDA_CC_OFFSET_AMD;
+    if ((gfx_cc & 0xf00) != 0x800 && (gfx_cc & 0xf00) != 0x900) {
+        return false;
+    }
+    return type == GGML_TYPE_F32 && ne11 == 1 && src0_ne[0] <= MMVF_SMALL_MAX_K;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
